@@ -69,7 +69,11 @@ function Orb({ phase, level }: { phase: Phase; level: number }) {
 
 function Transcript({ lines, phase }: { lines: Line[]; phase: Phase }) {
   const end = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => end.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }), [lines]);
+  React.useEffect(() => {
+    // Do not return this call. Some browsers hand back a Promise, and useEffect
+    // would treat that Promise as its cleanup and crash the page on the next line.
+    end.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [lines]);
   if (!lines.length) {
     return (
       <p className="px-1 py-6 text-center text-[13px] text-muted-foreground">

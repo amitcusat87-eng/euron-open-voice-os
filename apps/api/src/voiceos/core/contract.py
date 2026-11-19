@@ -10,7 +10,7 @@ internals (the control plane never imports Pipecat).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
@@ -111,7 +111,9 @@ class ResolvedAgent(_Model):
     privacy: PrivacySettings = PrivacySettings()
     cache: CacheSettings = CacheSettings()
     tools: list[ToolSpec] = Field(default_factory=list)
-    faq: list[str] = Field(default_factory=list)
+    # Legacy rows are plain strings. Newer rows are objects (question, answer, and
+    # optional category, keywords, active). The runtime normalizes both at lookup time.
+    faq: list[Any] = Field(default_factory=list)
     max_duration_s: int = Field(900, ge=30, le=7200)
     idle_timeout_s: int = Field(60, ge=10, le=600)
 
