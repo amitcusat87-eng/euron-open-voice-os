@@ -227,6 +227,52 @@ async def test_tts_timeout_errors_without_a_long_silent_wait() -> None:
     assert "ReadTimeout" in str(frames[-1].error)
 
 
+async def test_tts_http_error_does_not_expose_the_response_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "provider body must stay private"
+
+    class _ErrorBody:
+        async def __aenter__(self) -> _ErrorBody:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        async def aread(self) -> bytes:
+            return secret.encode()
+
+        async def aiter_bytes(self, _chunk_size: int | None = None):
+            yield secret.encode()
+
+        @property
+        def status_code(self) -> int:
+            return 502
+
+    class _Client:
+        def stream(self, *_args: object, **_kwargs: object) -> _ErrorBody:
+            return _ErrorBody()
+
+        async def aclose(self) -> None:
+            return None
+
+    service = SpeechServerTTSService(base_url="http://speech/v1", voice="af_heart")
+    await service._client.aclose()
+    service._client = _Client()  # type: ignore[assignment]
+    with caplog.at_level("WARNING"):
+        frames = [frame async for frame in service.run_tts("Hello.", "ctx-http")]
+    assert isinstance(frames[-1], ErrorFrame)
+    assert str(frames[-1].error) == "TTS returned 502"
+    assert secret not in str(frames[-1].error)
+    assert secret not in caplog.text
+
+    recorder = TurnRecorder(session_id="session-http")
+    await push(recorder, Clock(), 1.0, VADUserStartedSpeakingFrame())
+    await push(recorder, Clock(), 1.1, frames[-1])
+    assert recorder.errors == ["TTS returned 502"]
+    assert secret not in str(recorder.timings)
+
+
 async def test_tts_interruption_closes_the_request() -> None:
     closed = asyncio.Event()
 

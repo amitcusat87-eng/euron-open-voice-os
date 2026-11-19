@@ -74,7 +74,7 @@ class SpeechServerTTSService(TTSService):
         try:
             async with self._client.stream("POST", self._url, json=body) as resp:
                 if resp.status_code != 200:
-                    detail = (await resp.aread()).decode(errors="replace")[:300]
+                    await resp.aread()
                     log.warning(
                         "tts_error",
                         extra={
@@ -83,7 +83,7 @@ class SpeechServerTTSService(TTSService):
                             "context_id": context_id,
                         },
                     )
-                    yield ErrorFrame(error=f"TTS returned {resp.status_code}: {detail}")
+                    yield ErrorFrame(error=f"TTS returned {resp.status_code}")
                     return
                 await self.start_tts_usage_metrics(text)
                 carry = b""
