@@ -123,6 +123,7 @@ export function useVoiceSession(getTicket: () => Promise<SessionTicket>) {
       },
       onBotReady: () => patch({ phase: "listening" }),
       onUserStartedSpeaking: () => {
+        audio.current?.pause();
         segments.current = new Map();
         setState((s) => {
           const lines = [...s.lines];
@@ -138,6 +139,7 @@ export function useVoiceSession(getTicket: () => Promise<SessionTicket>) {
       },
       onUserTranscript: (t) => upsert("user", t.text, Boolean(t.final)),
       onBotStartedSpeaking: () => {
+        void audio.current?.play().catch(() => undefined);
         const turnEnded = userStoppedAt.current;
         const started = turnEnded == null ? null : (lastVoiceAt.current ?? turnEnded);
         userStoppedAt.current = null;
