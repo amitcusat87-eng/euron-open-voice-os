@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -163,10 +163,15 @@ class SpeechModels:
     ) -> Transcript:
         model = self.whisper(size)
         started = time.perf_counter()
+        # One decode. The library default walks 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 whenever
+        # the first pass looks unsure, and each pass re-decodes the whole utterance.
+        # A 2.5 s clip was taking about 18 s, past the 15 s transcript wait, so the
+        # turn ended with no text and the reply never started. Temperature stays 0.
         segments, info = model.transcribe(
             audio,
             language=language or None,
             beam_size=1,
+            temperature=0.0,
             vad_filter=False,  # the runtime already sends one detected utterance
             initial_prompt=prompt or None,
             condition_on_previous_text=False,
@@ -215,7 +220,11 @@ class SpeechModels:
         return sorted(self.kokoro().get_voices())
 
     def synthesize(self, text: str, *, voice: str, speed: float = 1.0) -> Iterator[bytes]:
-        """PCM16 mono at 24 kHz, one chunk per sentence."""
+        """PCM16 mono at 24 kHz, one chunk per sentence.
+
+        ``create()`` returns only after every phoneme batch in the sentence is done.
+        The HTTP path uses ``iter_pcm``, which yields each batch from ``create_stream``.
+        """
         lang = voice_language(voice)
         kokoro = self.kokoro()
         if voice not in kokoro.get_voices():
@@ -223,6 +232,22 @@ class SpeechModels:
         for sentence in split_sentences(text):
             samples, _ = kokoro.create(sentence, voice=voice, speed=speed, lang=lang)
             yield to_pcm16(samples)
+
+    async def iter_pcm(self, text: str, *, voice: str, speed: float = 1.0) -> AsyncIterator[bytes]:
+        """PCM16, one chunk per Kokoro phoneme batch.
+
+        The model object is the one loaded in ``kokoro()``. ``create_stream`` yields
+        the first batch before later batches are synthesized, and closing the
+        generator stops further batches. A sentence that is a single batch still
+        cannot emit audio before that batch's ``create`` returns.
+        """
+        lang = voice_language(voice)
+        kokoro = self.kokoro()
+        if voice not in kokoro.get_voices():
+            raise SpeechError(f"Unknown voice {voice!r}. List voices at GET /v1/voices")
+        for sentence in split_sentences(text):
+            async for samples, _rate in kokoro.create_stream(sentence, voice, speed, lang):
+                yield to_pcm16(samples)
 
 
 def _espeak_data_dir() -> str | None:

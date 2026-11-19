@@ -17,6 +17,7 @@ Usage (tokens, audio seconds, characters) comes from the services' own usage met
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -45,6 +46,12 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 from voiceos.core.contract import TurnReport, UsageReport
 
+log = logging.getLogger("voiceos.runtime")
+
+
+def _wall() -> str:
+    return datetime.now(UTC).isoformat()
+
 
 def _ms(start: float | None, end: float | None) -> float | None:
     if start is None or end is None or end < start:
@@ -70,6 +77,15 @@ class _Turn:
         self.llm_first: float | None = None
         self.tts_first: float | None = None
         self.bot_started: float | None = None
+        self.bot_stopped: float | None = None
+        self.speech_started_at: str | None = None
+        self.speech_stopped_at: str | None = None
+        self.transcript_final_at: str | None = None
+        self.llm_first_token_at: str | None = None
+        self.tts_first_audio_at: str | None = None
+        self.bot_started_at: str | None = None
+        self.bot_stopped_at: str | None = None
+        self.timing_logged = False
         self.user_text: list[str] = []
         self.agent_text: list[str] = []
         self.interrupted = False
@@ -101,8 +117,10 @@ class _Turn:
 class TurnRecorder(BaseObserver):
     """Observes a session's pipeline and builds its turn and usage reports."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None = None) -> None:
         super().__init__()
+        self.session_id = session_id
+        self.timings: list[dict[str, object]] = []
         self._now = time.monotonic
         self._seen: deque[int] = deque(maxlen=4096)
         self._seen_set: set[int] = set()
@@ -154,17 +172,20 @@ class TurnRecorder(BaseObserver):
             turn = self._user_turn()
             if turn.user_started is None:
                 turn.user_started = now
+                turn.speech_started_at = _wall()
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # The last pause before the turn ends is the real end of speech.
             turn = self._user_turn()
             if turn.user_stopped is None:
                 turn.speech_end = now
+                turn.speech_stopped_at = _wall()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             turn = self._user_turn()
             if turn.user_stopped is None:
                 turn.user_stopped = now
             if turn.speech_end is None:
                 turn.speech_end = now
+                turn.speech_stopped_at = _wall()
         elif isinstance(frame, InterruptionFrame):
             self.interruptions += 1
             if self._bot_speaking and self._turns:
@@ -172,26 +193,40 @@ class TurnRecorder(BaseObserver):
                 target = self._turns[-2] if len(self._turns) > 1 else self._turns[-1]
                 target.interrupted = True
         elif isinstance(frame, TranscriptionFrame):
+            turn = self._user_turn()
             if frame.text.strip():
-                turn = self._user_turn()
                 turn.user_text.append(frame.text.strip())
                 turn.transcript_at = now
+                turn.transcript_final_at = _wall()
+            elif frame.finalized:
+                # The provider finished and recognized nothing. No audio and no text.
+                log.warning(
+                    "empty final transcript",
+                    extra={"session_id": self.session_id, "turn_id": turn.index},
+                )
         elif isinstance(frame, LLMFullResponseStartFrame):
             pass
         elif isinstance(frame, LLMTextFrame):
             turn = self._current or self._open()
             if turn.llm_first is None:
                 turn.llm_first = now
+                turn.llm_first_token_at = _wall()
             turn.agent_text.append(frame.text)
         elif isinstance(frame, TTSAudioRawFrame):
             if self._current is not None and self._current.tts_first is None:
                 self._current.tts_first = now
+                self._current.tts_first_audio_at = _wall()
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             if self._current is not None and self._current.bot_started is None:
                 self._current.bot_started = now
+                self._current.bot_started_at = _wall()
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
+            if self._current is not None and self._current.bot_stopped is None:
+                self._current.bot_stopped = now
+                self._current.bot_stopped_at = _wall()
+                self._log_timing(self._current)
         elif isinstance(frame, MetricsFrame):
             self._metrics(frame)
         elif isinstance(frame, ErrorFrame):
@@ -199,8 +234,31 @@ class TurnRecorder(BaseObserver):
             self.errors.append(message)
             if self._current is not None:
                 self._current.error = message
+                self._log_timing(self._current, error=message)
 
     # ── internals ───────────────────────────────────────────────────────────────────
+    def _log_timing(self, turn: _Turn, *, error: str | None = None) -> None:
+        """One structured row per turn. No transcript text, audio, or credentials."""
+        if turn.timing_logged:
+            return
+        turn.timing_logged = True
+        row: dict[str, object] = {
+            "session_id": self.session_id,
+            "turn_id": turn.index,
+            "speech_started_at": turn.speech_started_at,
+            "speech_stopped_at": turn.speech_stopped_at,
+            "transcript_final_at": turn.transcript_final_at,
+            "llm_first_token_at": turn.llm_first_token_at,
+            "tts_first_audio_at": turn.tts_first_audio_at,
+            "bot_started_at": turn.bot_started_at,
+            "bot_stopped_at": turn.bot_stopped_at,
+            "total_response_ms": _ms(turn.speech_end or turn.user_stopped, turn.bot_started),
+        }
+        if error or turn.error:
+            row["response_error"] = (error or turn.error or "")[:300]
+        self.timings.append(row)
+        log.info("turn timing", extra=row)
+
     def _user_turn(self) -> _Turn:
         """The turn the caller is speaking in, opening one when needed.
 

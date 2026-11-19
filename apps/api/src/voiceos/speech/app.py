@@ -232,9 +232,13 @@ def create_app(settings: SpeechSettings | None = None) -> FastAPI:
         if len(body.input) > settings.speech_max_chars:
             raise SpeechError(f"Input longer than {settings.speech_max_chars} characters")
         started = time.perf_counter()
-        chunks = models.synthesize(body.input, voice=body.voice, speed=body.speed)
-        # Synthesize the first sentence before answering, so a bad voice is a clean 400 and
-        # the first bytes are real audio.
+        log.info(
+            "tts_request_started",
+            extra={"chars": len(body.input), "voice": body.voice},
+        )
+        # The first phoneme batch is synthesized before the response starts, so a bad
+        # voice is a clean 400 and the first bytes are real audio. Later batches stream.
+        pcm = models.iter_pcm(body.input, voice=body.voice, speed=body.speed)
         await tts_slots.acquire()
         released = False
 
@@ -247,22 +251,49 @@ def create_app(settings: SpeechSettings | None = None) -> FastAPI:
                 tts_slots.release()
 
         try:
-            first = await asyncio.to_thread(next, chunks, b"")
-        except BaseException:
+            first = await anext(pcm, b"")
+        except BaseException as exc:
             release()
+            log.warning(
+                "tts_error",
+                extra={
+                    "error": type(exc).__name__,
+                    "ms": round((time.perf_counter() - started) * 1000, 1),
+                    "voice": body.voice,
+                },
+            )
             raise
         first_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "tts_first_byte",
+            extra={"ms": round(first_ms, 1), "bytes": len(first), "voice": body.voice},
+        )
 
         async def stream() -> AsyncIterator[bytes]:
             try:
                 if body.response_format == "wav":
                     yield wav_header(KOKORO_SAMPLE_RATE)
-                yield first
-                while True:
-                    chunk = await asyncio.to_thread(next, chunks, None)
-                    if chunk is None:
-                        return
+                if first:
+                    yield first
+                async for chunk in pcm:
                     yield chunk
+                log.info(
+                    "tts_completed",
+                    extra={
+                        "ms": round((time.perf_counter() - started) * 1000, 1),
+                        "voice": body.voice,
+                    },
+                )
+            except BaseException as exc:
+                log.warning(
+                    "tts_error",
+                    extra={
+                        "error": type(exc).__name__,
+                        "ms": round((time.perf_counter() - started) * 1000, 1),
+                        "voice": body.voice,
+                    },
+                )
+                raise
             finally:
                 release()
 

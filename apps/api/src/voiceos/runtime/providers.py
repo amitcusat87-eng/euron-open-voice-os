@@ -70,6 +70,9 @@ def build_stt(p: ProviderConfig, agent_language: str) -> STTService:
             return OpenAISTTService(
                 api_key=_optional_key(p),
                 base_url=p.base_url,
+                # A blank final result must reach the turn strategy so the turn can end.
+                # The aggregator ignores whitespace, so this does not become an LLM message.
+                push_empty_transcripts=True,
                 settings=OpenAISTTService.Settings(model=p.model or "whisper-1", language=lang),
             )
         case "deepgram":
@@ -144,9 +147,12 @@ def build_tts(
 ) -> TTSService:
     namespace = f"{p.provider_id}:{p.adapter}:{p.model}:{p.voice}"
     extra: dict[str, Any] = {"phrase_cache": wiring(cache, namespace)} if cache else {}
-    # How long to wait for a synthesis to produce audio before calling it failed. Local
-    # models on a busy CPU can need more than Pipecat's 3 s default for a first sentence.
-    extra["stop_frame_timeout_s"] = max(3.0, min(p.timeout_s, 10.0))
+    # Kokoro emits no PCM until the first phoneme batch is synthesized. Playback and the
+    # HTTP read share this budget: when it elapses, the request fails with an error.
+    # It is not stretched to the provider's full timeout, which left the pipeline silent
+    # for the rest of that timeout after playback had already given up.
+    first_byte_s = max(3.0, min(p.timeout_s, 10.0))
+    extra["stop_frame_timeout_s"] = first_byte_s
 
     def cls(service: type[TTSService]) -> type[TTSService]:
         return cached(service) if cache else service
@@ -158,7 +164,7 @@ def build_tts(
                 voice=p.voice or "af_heart",
                 model=p.model or "kokoro",
                 api_key=p.api_key.get_secret_value() if p.api_key else None,
-                timeout_s=p.timeout_s,
+                timeout_s=first_byte_s,
                 **extra,
             )
         case "elevenlabs":

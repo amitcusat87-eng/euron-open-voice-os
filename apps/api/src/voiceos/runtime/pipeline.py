@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -26,8 +27,10 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     LLMRunFrame,
+    TranscriptionFrame,
     TTSSpeakFrame,
 )
+from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
@@ -87,11 +90,60 @@ def _turn_strategies(agent: ResolvedAgent) -> UserTurnStrategies:
             TranscriptionUserTurnStartStrategy(enable_interruptions=interrupt),
         ]
     stop: list[Any] = (
-        [TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
+        [
+            TurnAnalyzerUserTurnStopStrategy(
+                # The analyzer's own default waits 3 s of silence. That is after VAD has
+                # already waited vad_stop_secs, so an unsure prediction held the reply.
+                # Use the same window the agent already configured (0.4–0.7 s in practice).
+                turn_analyzer=LocalSmartTurnAnalyzerV3(
+                    params=SmartTurnParams(stop_secs=t.vad_stop_secs)
+                )
+            )
+        ]
         if t.mode == "smart"
         else [SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=t.vad_stop_secs)]
     )
-    return UserTurnStrategies(start=start, stop=stop)
+    return UserTurnStrategies(start=start, stop=[_close_on_empty_final(s) for s in stop])
+
+
+def _close_on_empty_final(strategy: Any) -> Any:
+    """End the turn when STT has already returned a blank final transcript.
+
+    The stock strategies refuse to stop without text, so the turn then sits until
+    ``transcript_wait_s`` (15 s). A blank result is final: nothing is sent to the LLM.
+    """
+    original = strategy._handle_transcription
+
+    async def _handle(frame: TranscriptionFrame) -> None:
+        if frame.finalized and not (frame.text or "").strip():
+            strategy._transcript_finalized = True
+            if hasattr(strategy, "_turn_complete"):
+                strategy._turn_complete = True
+            if hasattr(strategy, "_stt_wait_done"):
+                strategy._stt_wait_done = True
+            if hasattr(strategy, "_user_speech_wait_done"):
+                strategy._user_speech_wait_done = True
+            for name in ("_timeout_task", "_stt_timeout_task", "_user_speech_timeout_task"):
+                task = getattr(strategy, name, None)
+                if task is not None and getattr(strategy, "task_manager", None) is not None:
+                    await strategy.task_manager.cancel_task(task)
+                    setattr(strategy, name, None)
+            await strategy.trigger_user_turn_stopped()
+            return
+        await original(frame)
+
+    strategy._handle_transcription = _handle
+    return strategy
+
+
+def user_aggregator_params(agent: ResolvedAgent) -> LLMUserAggregatorParams:
+    return LLMUserAggregatorParams(
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=agent.turn.vad_stop_secs)),
+        user_turn_strategies=_turn_strategies(agent),
+        user_turn_stop_timeout=agent.turn.transcript_wait_s,
+        # Neither idle nor interrupted empty turns invent a prompt for the model.
+        empty_user_turn=EmptyUserTurnConfig(interrupted_prompt=None, idle_prompt=None),
+    )
 
 
 async def run_session(
@@ -104,7 +156,7 @@ async def run_session(
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> SessionReport:
     started_at = datetime.now(UTC)
-    recorder = TurnRecorder()
+    recorder = TurnRecorder(session_id=session_id)
     resources = Resources()
     end_reason: list[EndReason] = []
 
@@ -134,13 +186,7 @@ async def run_session(
         context = LLMContext(tools=tools) if tools else LLMContext()
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
-            user_params=LLMUserAggregatorParams(
-                vad_analyzer=SileroVADAnalyzer(
-                    params=VADParams(stop_secs=agent.turn.vad_stop_secs)
-                ),
-                user_turn_strategies=_turn_strategies(agent),
-                user_turn_stop_timeout=agent.turn.transcript_wait_s,
-            ),
+            user_params=user_aggregator_params(agent),
         )
         router = TurnRouter(
             agent,

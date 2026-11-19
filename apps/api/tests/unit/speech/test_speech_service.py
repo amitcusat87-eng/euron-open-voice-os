@@ -62,6 +62,10 @@ class FakeKokoro:
         self.sentences.append((text, lang))
         return np.zeros(2400, dtype=np.float32), 24_000
 
+    async def create_stream(self, text: str, voice: str, speed: float = 1.0, lang: str = "en-us"):
+        samples, rate = self.create(text, voice=voice, speed=speed, lang=lang)
+        yield samples, rate
+
 
 def settings(tmp_path: Path, **kw: Any) -> SpeechSettings:
     values: dict[str, Any] = {
@@ -104,6 +108,9 @@ async def test_transcription_shapes_and_model_choice(speech: Any) -> None:
     call = models._whisper["small"].calls[0]
     assert call["language"] == "hi" and call["samples"] == 16_000  # resampled to 16 kHz mono
     assert call["initial_prompt"].startswith("नमस्ते")  # steers Whisper to Devanagari
+    # One POST is one decode. A temperature list would re-run the utterance.
+    assert call["temperature"] == 0.0 and call["beam_size"] == 1
+    assert len(models._whisper["small"].calls) == 1
 
     r = await client.post(
         "/v1/audio/transcriptions",
